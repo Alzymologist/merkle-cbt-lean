@@ -5,7 +5,7 @@ This crate is based on CBMT implementation in https://crates.io/crates/merkle-cb
 
 Although indeed efficient both in performance and memory requirements, above mentioned crates memory consumption was found to be too high for its use in really constrained embedded environments (like [Kampela device](https://github.com/Kalapaja/kampela-firmware), or Ledger). We have created this crate to handle proof check with as small memory access and consumption as possible, so that proof lemmas could be stored on external memory or transferred through serial data interface. Note that construction of proof is not optimized, as in typical application it is performed in a regular memory environment and its difficulty is negligible. Root value calculated by this crate and `merkle-cbt` is designed and checked to be identical, this above crate should be used instead of this one where memory limitations are not critical.
 
-We've decided to make this a separate crate to avoid confusion in proof structures and to keep both modulse as minimalistic as they are.
+We've decided to make this a separate crate to avoid confusion in proof structures and to keep both modules as minimalistic as they are.
 
 ## Concept
 
