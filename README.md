@@ -9,7 +9,7 @@ We've decided to make this a separate crate to avoid confusion in proof structur
 
 ## Concept
 
-To limit memory, we've replaced width graph traverse with depth. Thus, only one branch at a time is stored simultaneously, and CMBT is always much wider than it is tall. To achieve this, we've had to change sorting of the lemmas accordingly, otherwise construction is conceptually same as in abovementioned crate. Main drawback here is roughly quadratic traverse time as opposed to linear width traverse, as, starting from below, we have to traverse whole tree for every leaf.
+To limit memory, we've replaced width graph traverse with depth. Thus, only one branch at a time is stored simultaneously, and CMBT is always much wider than it is tall. To achieve this, we've had to change sorting of the lemmas accordingly, otherwise construction is conceptually same as in above mentioned crate. Main drawback here is roughly quadratic traverse time as opposed to linear width traverse, as, starting from below, we have to traverse whole tree for every leaf.
 
 ## Detailed operation
 
