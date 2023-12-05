@@ -25,7 +25,7 @@ Every time a node is merged into this buffer, it is written into corresponding l
 
 ### Proof check algorithm
 
-Leftmost leaf is found and its path to root is consructed. All proofs to the left of the new path and to the right of last path are merged into buffer from left to right: first lemmas immediately to the right of last path are merged going from bottom up, then lemmas to the left of new path are merged top-down, leaving nodes above paths intersection point intact. Then the leaf is merged into the buffer. This procedure is repeated for every leaf until all are used up, all remaining proofs on the right of the last path are then merged from bottom up (left to right). Lemmas pool should be checked for total lemmas consumption.
+Leftmost leaf is found and its path to root is constructed. All proofs to the left of the new path and to the right of last path are merged into buffer from left to right: first lemmas immediately to the right of last path are merged going from bottom up, then lemmas to the left of new path are merged top-down, leaving nodes above paths intersection point intact. Then the leaf is merged into the buffer. This procedure is repeated for every leaf until all are used up, all remaining proofs on the right of the last path are then merged from bottom up (left to right). Lemmas pool should be checked for total lemmas consumption.
 
 ## Notes
 
