@@ -2,95 +2,72 @@
 #![deny(unused_crate_dependencies)]
 
 #[cfg(any(feature = "std", test))]
+#[macro_use]
 extern crate std;
 
 #[cfg(all(not(feature = "std"), not(test)))]
+#[macro_use]
 extern crate alloc;
 
 #[cfg(all(not(feature = "std"), not(test)))]
 extern crate core;
 
+#[cfg(feature = "std")]
+use std::error::Error;
 #[cfg(any(feature = "std", test))]
 use std::{
     fmt::{Debug, Display, Formatter, Result as FmtResult},
     marker::PhantomData,
+    string::String,
     vec::Vec,
 };
 
 #[cfg(all(not(feature = "std"), not(test)))]
-use alloc::vec::Vec;
+use alloc::{string::String, vec::Vec};
 #[cfg(all(not(feature = "std"), not(test)))]
 use core::{
     fmt::{Debug, Display, Formatter, Result as FmtResult},
     marker::PhantomData,
 };
 
-pub trait ExternalMemory: Debug {
-    type ExternalMemoryError: Debug + Display + Eq + PartialEq;
+use external_memory_tools::ExternalMemory;
+
+/// Trait describing how Merkle tree leaves are generated and merged.
+///
+/// Leaves are always sized, generic parameter N is leaf size.
+pub trait Hasher<const N: usize> {
+    fn make(bytes: &[u8]) -> [u8; N];
+    fn merge(left: &[u8; N], right: &[u8; N]) -> [u8; N];
 }
 
-impl ExternalMemory for () {
-    type ExternalMemoryError = NoEntries;
-}
+/// Trait describing how Merkle tree leaves are accessed from memory.
+///
+/// Need to write the leaf into memory exists only when generating proof, is
+/// unlocked with feature `proof-gen`.
+pub trait Leaf<const N: usize, E: ExternalMemory>: Clone + Copy + Debug + Sized {
+    fn read(&self, ext_memory: &mut E) -> Result<[u8; N], E::ExternalMemoryError>;
 
-#[derive(Debug, Eq, PartialEq)]
-pub enum NoEntries {}
-
-impl Display for NoEntries {
-    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
-        write!(f, "")
-    }
-}
-
-pub trait Leaf<E: ExternalMemory>: Clone + Copy + Debug {
-    type Value: AsRef<[u8]> + Clone + Copy + Debug + PartialEq;
-    fn merge(left: &Self::Value, right: &Self::Value) -> Self::Value;
-    fn value(&self, ext_memory: &mut E) -> Result<Self::Value, E::ExternalMemoryError>;
-    fn from_value(value: Self::Value, ext_memory: &mut E) -> Result<Self, E::ExternalMemoryError>;
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct Blake3Leaf([u8; 32]);
-
-impl<E: ExternalMemory> Leaf<E> for Blake3Leaf {
-    type Value = [u8; 32];
-    fn merge(left: &Self::Value, right: &Self::Value) -> Self::Value {
-        blake3::hash(&[left.as_slice(), right.as_slice()].concat()).into()
-    }
-    fn value(&self, _ext_memory: &mut E) -> Result<Self::Value, E::ExternalMemoryError> {
-        Ok(self.0)
-    }
-    fn from_value(value: Self::Value, _ext_memory: &mut E) -> Result<Self, E::ExternalMemoryError> {
-        Ok(Self(value))
-    }
-}
-
-impl Blake3Leaf {
-    pub fn from_unhashed(unhashed: &[u8]) -> Self {
-        Self(blake3::hash(unhashed).into())
-    }
+    #[cfg(any(feature = "proof-gen", test))]
+    fn write(data: [u8; N], ext_memory: &mut E) -> Result<Self, E::ExternalMemoryError>;
 }
 
 pub fn first_leaf_index(total_leaves: usize) -> usize {
     total_leaves - 1
 }
 
-pub fn number_of_layers<L, E>(leaves: &[Node<L, E>]) -> Result<usize, ErrorMT<E>>
-where
-    L: Leaf<E>,
-    E: ExternalMemory,
-{
+pub fn number_of_layers<const N: usize, E: ExternalMemory>(
+    leaves: &[Node<N>],
+) -> Result<usize, ErrorMT<E>> {
     match leaves.last() {
         Some(a) => Ok(a.index.layer() as usize + 1usize),
         None => Err(ErrorMT::NoLeavesInput),
     }
 }
 
-fn has_duplicates<L, E>(values: &[L::Value]) -> Result<bool, ErrorMT<E>>
-where
-    L: Leaf<E>,
-    E: ExternalMemory,
-{
+#[cfg(any(feature = "proof-gen", test))]
+fn has_duplicates<const N: usize, E: ExternalMemory>(
+    values: &[[u8; N]],
+) -> Result<bool, ErrorMT<E>> {
     if values.is_empty() {
         Err(ErrorMT::NoValuesInput)
     } else {
@@ -99,33 +76,33 @@ where
 }
 
 #[derive(Debug)]
-pub struct MerkleProof<L, E>
+pub struct MerkleProof<const N: usize, L, E, H>
 where
-    L: Leaf<E>,
+    L: Leaf<N, E>,
     E: ExternalMemory,
+    H: Hasher<N>,
 {
-    pub leaves: Vec<Node<L, E>>,
+    pub leaves: Vec<Node<N>>,
     pub lemmas: Vec<L>,
-    buffer: Vec<Option<L::Value>>,
+    buffer: Vec<Option<[u8; N]>>,
     previous_path: Option<Vec<Index>>,
     leftmost_leaf_position: usize,
+    ext_memory: PhantomData<E>,
+    hasher_type: PhantomData<H>,
 }
 
-impl<L, E> MerkleProof<L, E>
+impl<const N: usize, L, E, H> MerkleProof<N, L, E, H>
 where
-    L: Leaf<E>,
+    L: Leaf<N, E>,
     E: ExternalMemory,
+    H: Hasher<N>,
 {
-    pub fn new(
-        leaves: Vec<Node<L, E>>,
-        lemmas: Vec<L>,
-        ext_memory: &mut E,
-    ) -> Result<Self, ErrorMT<E>> {
+    pub fn new(leaves: Vec<Node<N>>, lemmas: Vec<L>) -> Result<Self, ErrorMT<E>> {
         let number_of_layers = number_of_layers(&leaves)?;
 
         for i in 0..leaves.len() - 1 {
             for j in i + 1..leaves.len() {
-                if leaves[j].value.value(ext_memory) == leaves[i].value.value(ext_memory) {
+                if leaves[j].value == leaves[i].value {
                     return Err(ErrorMT::DuplicateLeafValues);
                 }
             }
@@ -149,18 +126,37 @@ where
             buffer,
             previous_path: None,
             leftmost_leaf_position,
+            ext_memory: PhantomData,
+            hasher_type: PhantomData,
         })
     }
 
+    pub fn new_with_external_indices(
+        leaves_values: Vec<[u8; N]>,
+        indices: Vec<u32>,
+        lemmas: Vec<L>,
+    ) -> Result<Self, ErrorMT<E>> {
+        if leaves_values.len() != indices.len() {
+            return Err(ErrorMT::IndicesValuesLengthMismatch);
+        }
+        let mut leaves: Vec<Node<N>> = Vec::new();
+        for i in 0..leaves_values.len() {
+            let leaf = Node::new(Index(indices[i]), leaves_values[i]);
+            leaves.push(leaf);
+        }
+        Self::new(leaves, lemmas)
+    }
+
+    #[cfg(any(feature = "proof-gen", test))]
     pub fn for_leaves_subset(
-        all_values: Vec<L::Value>,
-        remaining_as_leaves: &[L::Value],
+        all_values: Vec<[u8; N]>,
+        remaining_as_leaves: &[[u8; N]],
         ext_memory: &mut E,
     ) -> Result<Self, ErrorMT<E>> {
-        if has_duplicates::<L, E>(&all_values)? {
+        if has_duplicates::<N, E>(&all_values)? {
             return Err(ErrorMT::DuplicateLeafValues);
         }
-        if has_duplicates::<L, E>(remaining_as_leaves)? {
+        if has_duplicates::<N, E>(remaining_as_leaves)? {
             return Err(ErrorMT::DuplicateRemainingValues);
         }
 
@@ -176,12 +172,11 @@ where
             remaining_indices_in_whole_set.push(index_in_whole_set);
         }
 
-        let mut leaves: Vec<Node<L, E>> = Vec::new();
-        let mut lemma_collector: Vec<Node<L, E>> = Vec::new();
+        let mut leaves: Vec<Node<N>> = Vec::new();
+        let mut lemma_collector: Vec<Node<N>> = Vec::new();
 
         for (index_in_whole_set, value) in all_values.into_iter().enumerate() {
             let index = Index((index_in_whole_set + first_leaf_index) as u32);
-            let value = L::from_value(value, ext_memory).map_err(ErrorMT::ExternalMemory)?;
             let node = Node::new(index, value);
 
             if remaining_indices_in_whole_set.contains(&index_in_whole_set) {
@@ -191,12 +186,12 @@ where
             }
         }
 
-        let number_of_layers = number_of_layers::<L, E>(&lemma_collector)?;
+        let number_of_layers = number_of_layers::<N, E>(&lemma_collector)?;
 
         for layer in (0..number_of_layers).rev() {
             let mut lemmas_modified = false;
             let mut removal_set: Vec<Index> = Vec::new();
-            let mut added_lemmas: Vec<Node<L, E>> = Vec::new();
+            let mut added_lemmas: Vec<Node<N>> = Vec::new();
             for (n, node) in lemma_collector.iter().enumerate() {
                 if node.index.layer() == layer as u32 {
                     if let Some(node_sibling_index) = node.index.sibling() {
@@ -212,21 +207,8 @@ where
                                     .index
                                     .parent()
                                     .expect("if there is a sibling, there must be a parent");
-                                let parent_value = L::merge(
-                                    &left_node
-                                        .value
-                                        .value(ext_memory)
-                                        .map_err(ErrorMT::ExternalMemory)?,
-                                    &right_node
-                                        .value
-                                        .value(ext_memory)
-                                        .map_err(ErrorMT::ExternalMemory)?,
-                                );
-                                added_lemmas.push(Node::new(
-                                    parent_index,
-                                    L::from_value(parent_value, ext_memory)
-                                        .map_err(ErrorMT::ExternalMemory)?,
-                                ));
+                                let parent_value = H::merge(&left_node.value, &right_node.value);
+                                added_lemmas.push(Node::new(parent_index, parent_value));
                                 lemmas_modified = true;
                             }
                         }
@@ -241,23 +223,40 @@ where
         }
 
         lemma_collector.sort_by(|a, b| a.index.path_top_down().cmp(&b.index.path_top_down()));
-        let lemmas = lemma_collector.into_iter().map(|node| node.value).collect();
+        let mut lemmas: Vec<L> = Vec::new();
+        for node in lemma_collector.into_iter() {
+            let lemma_to_add = L::write(node.value, ext_memory).map_err(ErrorMT::ExternalMemory)?;
+            lemmas.push(lemma_to_add)
+        }
 
-        Self::new(leaves, lemmas, ext_memory)
+        Self::new(leaves, lemmas)
+    }
+
+    pub fn indices(&self) -> Vec<u32> {
+        let mut out: Vec<u32> = Vec::new();
+        for leaf in self.leaves.iter() {
+            out.push(leaf.index.0);
+        }
+        out
+    }
+
+    pub fn lemmas(&self, ext_memory: &mut E) -> Result<Vec<[u8; N]>, ErrorMT<E>> {
+        let mut out: Vec<[u8; N]> = Vec::new();
+        for lemma in self.lemmas.iter() {
+            out.push(lemma.read(ext_memory).map_err(ErrorMT::ExternalMemory)?);
+        }
+        Ok(out)
     }
 
     pub fn update(&mut self, ext_memory: &mut E) -> Result<(), ErrorMT<E>> {
         let leftmost_leaf = self.leftmost_leaf();
         let leftmost_leaf_index = leftmost_leaf.index;
-        let leftmost_leaf_value = leftmost_leaf
-            .value
-            .value(ext_memory)
-            .map_err(ErrorMT::ExternalMemory)?;
+        let leftmost_leaf_value = leftmost_leaf.value;
 
         let path_top_down = leftmost_leaf_index.path_top_down();
         let first_layer_below_bifurcation = self.first_layer_below_bifurcation(&path_top_down)?;
 
-        let mut new_buffer_calc: Option<L::Value> = None;
+        let mut new_buffer_calc: Option<[u8; N]> = None;
         for (i, buffer_element) in self.buffer.iter_mut().enumerate().rev() {
             if i == first_layer_below_bifurcation {
                 break;
@@ -265,26 +264,26 @@ where
             if let Some(buffer_element_content) = buffer_element {
                 if let Some(new_buffer_calc_content) = new_buffer_calc {
                     new_buffer_calc =
-                        Some(L::merge(buffer_element_content, &new_buffer_calc_content));
+                        Some(H::merge(buffer_element_content, &new_buffer_calc_content));
                     *buffer_element = None;
                 } else {
-                    new_buffer_calc = Some(L::merge(
+                    new_buffer_calc = Some(H::merge(
                         buffer_element_content,
                         &self
                             .lemmas
                             .remove(0)
-                            .value(ext_memory)
+                            .read(ext_memory)
                             .map_err(ErrorMT::ExternalMemory)?,
                     ));
                     *buffer_element = None;
                 }
             } else if let Some(new_buffer_calc_content) = new_buffer_calc {
-                new_buffer_calc = Some(L::merge(
+                new_buffer_calc = Some(H::merge(
                     &new_buffer_calc_content,
                     &self
                         .lemmas
                         .remove(0)
-                        .value(ext_memory)
+                        .read(ext_memory)
                         .map_err(ErrorMT::ExternalMemory)?,
                 ));
             }
@@ -301,7 +300,7 @@ where
                 self.buffer[layer + 1] = Some(
                     self.lemmas
                         .remove(0)
-                        .value(ext_memory)
+                        .read(ext_memory)
                         .map_err(ErrorMT::ExternalMemory)?,
                 );
             }
@@ -311,7 +310,7 @@ where
         for (i, buffer_element) in self.buffer.iter_mut().enumerate().rev() {
             if leftmost_leaf_index.layer() >= i as u32 {
                 if let Some(buffer_element_content) = buffer_element {
-                    new_buffer_calc = L::merge(buffer_element_content, &new_buffer_calc);
+                    new_buffer_calc = H::merge(buffer_element_content, &new_buffer_calc);
                     *buffer_element = None;
                 } else {
                     *buffer_element = Some(new_buffer_calc);
@@ -323,7 +322,7 @@ where
         Ok(())
     }
 
-    pub fn leftmost_leaf(&mut self) -> &Node<L, E> {
+    pub fn leftmost_leaf(&mut self) -> &Node<N> {
         let leftmost_leaf = &self.leaves[self.leftmost_leaf_position];
         self.leftmost_leaf_position += 1;
         if self.leftmost_leaf_position == self.leaves.len() {
@@ -351,14 +350,14 @@ where
         }
     }
 
-    pub fn calculate_root(&mut self, ext_memory: &mut E) -> Result<L::Value, ErrorMT<E>> {
-        let mut found_root: Option<L::Value> = None;
+    pub fn calculate_root(&mut self, ext_memory: &mut E) -> Result<[u8; N], ErrorMT<E>> {
+        let mut found_root: Option<[u8; N]> = None;
 
         // This guarantees that all leaves are consumed.
         for _i in 0..self.leaves.len() {
             self.update(ext_memory)?;
         }
-        let mut new_buffer_calc: Option<L::Value> = None;
+        let mut new_buffer_calc: Option<[u8; N]> = None;
         for (i, buffer_element) in self.buffer.iter_mut().enumerate().rev() {
             if i == 0 {
                 if new_buffer_calc.is_some() {
@@ -369,26 +368,26 @@ where
             if let Some(buffer_element_content) = buffer_element {
                 if let Some(new_buffer_calc_content) = new_buffer_calc {
                     new_buffer_calc =
-                        Some(L::merge(buffer_element_content, &new_buffer_calc_content));
+                        Some(H::merge(buffer_element_content, &new_buffer_calc_content));
                     *buffer_element = None;
                 } else {
-                    new_buffer_calc = Some(L::merge(
+                    new_buffer_calc = Some(H::merge(
                         buffer_element_content,
                         &self
                             .lemmas
                             .remove(0)
-                            .value(ext_memory)
+                            .read(ext_memory)
                             .map_err(ErrorMT::ExternalMemory)?,
                     ));
                     *buffer_element = None;
                 }
             } else if let Some(new_buffer_calc_content) = new_buffer_calc {
-                new_buffer_calc = Some(L::merge(
+                new_buffer_calc = Some(H::merge(
                     &new_buffer_calc_content,
                     &self
                         .lemmas
                         .remove(0)
-                        .value(ext_memory)
+                        .read(ext_memory)
                         .map_err(ErrorMT::ExternalMemory)?,
                 ));
             }
@@ -408,11 +407,12 @@ where
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub enum ErrorMT<E: ExternalMemory> {
     DuplicateLeafValues,
     DuplicateRemainingValues,
     ExternalMemory(E::ExternalMemoryError),
+    IndicesValuesLengthMismatch,
     LemmasNotEmpty,
     NoLeavesInput,
     NoValuesInput,
@@ -422,28 +422,46 @@ pub enum ErrorMT<E: ExternalMemory> {
     UnknownRemainingLeaf,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct Node<L, E>
-where
-    L: Leaf<E>,
-    E: ExternalMemory,
-{
-    pub index: Index,
-    pub value: L,
-    ext_memory_type: PhantomData<E>,
+impl<E: ExternalMemory> ErrorMT<E> {
+    fn error_text(&self) -> String {
+        match &self {
+            ErrorMT::DuplicateLeafValues => String::from(""),
+            ErrorMT::DuplicateRemainingValues => String::from(""),
+            ErrorMT::ExternalMemory(external_memory_error) => format!(" {external_memory_error}"),
+            ErrorMT::IndicesValuesLengthMismatch => String::from(""),
+            ErrorMT::LemmasNotEmpty => String::from(""),
+            ErrorMT::NoLeavesInput => String::from(""),
+            ErrorMT::NoValuesInput => String::from(""),
+            ErrorMT::PrevPathShorter => String::from(""),
+            ErrorMT::PrevPathIdentical => String::from(""),
+            ErrorMT::RootUnavailable => String::from(""),
+            ErrorMT::UnknownRemainingLeaf => String::from(""),
+        }
+    }
 }
 
-impl<L, E> Node<L, E>
-where
-    L: Leaf<E>,
-    E: ExternalMemory,
-{
-    pub fn new(index: Index, value: L) -> Self {
-        Self {
-            index,
-            value,
-            ext_memory_type: PhantomData,
-        }
+impl<E: ExternalMemory> Display for ErrorMT<E> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        write!(f, "{}", self.error_text())
+    }
+}
+
+#[cfg(feature = "std")]
+impl<E: ExternalMemory> Error for ErrorMT<E> {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        None
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Node<const N: usize> {
+    pub index: Index,
+    pub value: [u8; N],
+}
+
+impl<const N: usize> Node<N> {
+    pub fn new(index: Index, value: [u8; N]) -> Self {
+        Self { index, value }
     }
 }
 
@@ -503,6 +521,32 @@ mod tests {
         }
     }
 
+    const LEN: usize = 32;
+
+    #[derive(Debug)]
+    struct Blake3Hasher;
+
+    impl Hasher<LEN> for Blake3Hasher {
+        fn make(bytes: &[u8]) -> [u8; LEN] {
+            blake3::hash(bytes).into()
+        }
+        fn merge(left: &[u8; LEN], right: &[u8; LEN]) -> [u8; LEN] {
+            blake3::hash(&[left.as_slice(), right.as_slice()].concat()).into()
+        }
+    }
+
+    #[derive(Copy, Clone, Debug)]
+    struct Blake3Leaf([u8; LEN]);
+
+    impl<E: ExternalMemory> Leaf<LEN, E> for Blake3Leaf {
+        fn read(&self, _ext_memory: &mut E) -> Result<[u8; LEN], E::ExternalMemoryError> {
+            Ok(self.0)
+        }
+        fn write(value: [u8; LEN], _ext_memory: &mut E) -> Result<Self, E::ExternalMemoryError> {
+            Ok(Self(value))
+        }
+    }
+
     #[test]
     fn find_node_layer() {
         assert_eq!(Index(0).layer(), 0);
@@ -537,38 +581,35 @@ mod tests {
 
     #[test]
     fn leftmost_node() {
-        let mut merkle_proof_mock = MerkleProof::<Blake3Leaf, ()>::new(
+        let mut merkle_proof_mock = MerkleProof::<LEN, Blake3Leaf, (), Blake3Hasher>::new(
             vec![
-                Node::<Blake3Leaf, ()>::new(Index(3), Blake3Leaf([1; 32])),
-                Node::<Blake3Leaf, ()>::new(Index(9), Blake3Leaf([4; 32])),
-                Node::<Blake3Leaf, ()>::new(Index(12), Blake3Leaf([7; 32])),
+                Node::<LEN>::new(Index(3), [1; LEN]),
+                Node::<LEN>::new(Index(9), [4; LEN]),
+                Node::<LEN>::new(Index(12), [7; LEN]),
             ],
             vec![],
-            &mut (),
         )
         .unwrap();
         assert_eq!(merkle_proof_mock.leftmost_leaf().index.0, 9);
 
-        let mut merkle_proof_mock = MerkleProof::<Blake3Leaf, ()>::new(
+        let mut merkle_proof_mock = MerkleProof::<LEN, Blake3Leaf, (), Blake3Hasher>::new(
             vec![
-                Node::<Blake3Leaf, ()>::new(Index(1), Blake3Leaf([1; 32])),
-                Node::<Blake3Leaf, ()>::new(Index(5), Blake3Leaf([6; 32])),
-                Node::<Blake3Leaf, ()>::new(Index(13), Blake3Leaf([3; 32])),
+                Node::<LEN>::new(Index(1), [1; LEN]),
+                Node::<LEN>::new(Index(5), [6; LEN]),
+                Node::<LEN>::new(Index(13), [3; LEN]),
             ],
             vec![],
-            &mut (),
         )
         .unwrap();
         assert_eq!(merkle_proof_mock.leftmost_leaf().index.0, 13);
 
-        let mut merkle_proof_mock = MerkleProof::<Blake3Leaf, ()>::new(
+        let mut merkle_proof_mock = MerkleProof::<LEN, Blake3Leaf, (), Blake3Hasher>::new(
             vec![
-                Node::<Blake3Leaf, ()>::new(Index(1), Blake3Leaf([4; 32])),
-                Node::<Blake3Leaf, ()>::new(Index(12), Blake3Leaf([8; 32])),
-                Node::<Blake3Leaf, ()>::new(Index(6), Blake3Leaf([3; 32])),
+                Node::<LEN>::new(Index(1), [4; LEN]),
+                Node::<LEN>::new(Index(12), [8; LEN]),
+                Node::<LEN>::new(Index(6), [3; LEN]),
             ],
             vec![],
-            &mut (),
         )
         .unwrap();
         assert_eq!(merkle_proof_mock.leftmost_leaf().index.0, 12);
@@ -576,13 +617,12 @@ mod tests {
 
     #[test]
     fn two_leaf_tree() {
-        let mut merkle_proof = MerkleProof::<Blake3Leaf, ()>::new(
+        let mut merkle_proof = MerkleProof::<LEN, Blake3Leaf, (), Blake3Hasher>::new(
             vec![
-                Node::<Blake3Leaf, ()>::new(Index(1), Blake3Leaf([0; 32])),
-                Node::<Blake3Leaf, ()>::new(Index(2), Blake3Leaf([1; 32])),
+                Node::<LEN>::new(Index(1), [0; LEN]),
+                Node::<LEN>::new(Index(2), [1; LEN]),
             ],
             vec![],
-            &mut (),
         )
         .unwrap();
         let root = merkle_proof.calculate_root(&mut ()).unwrap();
@@ -592,8 +632,8 @@ mod tests {
         assert_eq!(root, root_merkle_cbt);
     }
 
-    fn test_set(total_leaves: usize) -> Vec<[u8; 32]> {
-        let mut testbed: Vec<[u8; 32]> = Vec::new();
+    fn test_set(total_leaves: usize) -> Vec<[u8; LEN]> {
+        let mut testbed: Vec<[u8; LEN]> = Vec::new();
         for i in 0..total_leaves {
             testbed.push(blake3::hash(&i.to_le_bytes()).into());
         }
@@ -602,19 +642,15 @@ mod tests {
 
     fn set_test(total_leaves: usize) {
         let test_set = test_set(total_leaves);
-        let mut merkle_proof = MerkleProof::<Blake3Leaf, ()>::new(
+        let mut merkle_proof = MerkleProof::<LEN, Blake3Leaf, (), Blake3Hasher>::new(
             test_set
                 .iter()
                 .enumerate()
                 .map(|(i, array)| {
-                    Node::<Blake3Leaf, ()>::new(
-                        Index((i + first_leaf_index(total_leaves)) as u32),
-                        Blake3Leaf(*array),
-                    )
+                    Node::<LEN>::new(Index((i + first_leaf_index(total_leaves)) as u32), *array)
                 })
                 .collect(),
             vec![],
-            &mut (),
         )
         .unwrap();
         let root = merkle_proof.calculate_root(&mut ()).unwrap();
@@ -657,13 +693,8 @@ mod tests {
     fn proof_test_1() {
         let all_values = vec![[0; 32], [1; 32]];
         let remaining_as_leaves = &[[0; 32]];
-        let mut merkle_proof: MerkleProof<Blake3Leaf, ()> =
-            MerkleProof::<Blake3Leaf, ()>::for_leaves_subset(
-                all_values,
-                remaining_as_leaves,
-                &mut (),
-            )
-            .unwrap();
+        let mut merkle_proof: MerkleProof<LEN, Blake3Leaf, (), Blake3Hasher> =
+            MerkleProof::for_leaves_subset(all_values, remaining_as_leaves, &mut ()).unwrap();
         let root: [u8; 32] = merkle_proof.calculate_root(&mut ()).unwrap();
 
         let leaves = &[[0; 32], [1; 32]];
@@ -675,13 +706,8 @@ mod tests {
     fn proof_test_2() {
         let all_values = vec![[0; 32], [1; 32], [2; 32], [3; 32], [4; 32]];
         let remaining_as_leaves = &[[0; 32], [2; 32]];
-        let mut merkle_proof: MerkleProof<Blake3Leaf, ()> =
-            MerkleProof::<Blake3Leaf, ()>::for_leaves_subset(
-                all_values,
-                remaining_as_leaves,
-                &mut (),
-            )
-            .unwrap();
+        let mut merkle_proof: MerkleProof<LEN, Blake3Leaf, (), Blake3Hasher> =
+            MerkleProof::for_leaves_subset(all_values, remaining_as_leaves, &mut ()).unwrap();
         let root: [u8; 32] = merkle_proof.calculate_root(&mut ()).unwrap();
 
         let leaves = &[[0; 32], [1; 32], [2; 32], [3; 32], [4; 32]];
@@ -695,13 +721,8 @@ mod tests {
             [0; 32], [1; 32], [2; 32], [3; 32], [4; 32], [5; 32], [6; 32],
         ];
         let remaining_as_leaves = &[[0; 32], [6; 32]];
-        let mut merkle_proof: MerkleProof<Blake3Leaf, ()> =
-            MerkleProof::<Blake3Leaf, ()>::for_leaves_subset(
-                all_values,
-                remaining_as_leaves,
-                &mut (),
-            )
-            .unwrap();
+        let mut merkle_proof: MerkleProof<LEN, Blake3Leaf, (), Blake3Hasher> =
+            MerkleProof::for_leaves_subset(all_values, remaining_as_leaves, &mut ()).unwrap();
         let root: [u8; 32] = merkle_proof.calculate_root(&mut ()).unwrap();
 
         let leaves = &[
@@ -718,12 +739,8 @@ mod tests {
         let test_subset = [test_set[1], test_set[12], test_set[118]];
         let root_merkle_cbt = CBMT::<[u8; 32], MergeHashes>::build_merkle_root(&test_set);
 
-        let mut merkle_proof = MerkleProof::<Blake3Leaf, ()>::for_leaves_subset(
-            test_set,
-            test_subset.as_slice(),
-            &mut (),
-        )
-        .unwrap();
+        let mut merkle_proof: MerkleProof<LEN, Blake3Leaf, (), Blake3Hasher> =
+            MerkleProof::for_leaves_subset(test_set, test_subset.as_slice(), &mut ()).unwrap();
         let root: [u8; 32] = merkle_proof.calculate_root(&mut ()).unwrap();
 
         assert_eq!(root, root_merkle_cbt);
@@ -736,7 +753,7 @@ mod tests {
         ];
         let remaining_as_leaves = &[[0; 32], [3; 32]];
         assert_eq!(
-            MerkleProof::<Blake3Leaf, ()>::for_leaves_subset(
+            MerkleProof::<LEN, Blake3Leaf, (), Blake3Hasher>::for_leaves_subset(
                 all_values,
                 remaining_as_leaves,
                 &mut ()
@@ -751,7 +768,7 @@ mod tests {
         let all_values = vec![[0; 32], [1; 32], [2; 32], [3; 32]];
         let remaining_as_leaves = &[[1; 32], [1; 32]];
         assert_eq!(
-            MerkleProof::<Blake3Leaf, ()>::for_leaves_subset(
+            MerkleProof::<LEN, Blake3Leaf, (), Blake3Hasher>::for_leaves_subset(
                 all_values,
                 remaining_as_leaves,
                 &mut ()
@@ -766,7 +783,7 @@ mod tests {
         let all_values = vec![[0; 32], [1; 32], [2; 32], [3; 32], [4; 32], [5; 32]];
         let remaining_as_leaves = &[[0; 32], [6; 32]];
         assert_eq!(
-            MerkleProof::<Blake3Leaf, ()>::for_leaves_subset(
+            MerkleProof::<LEN, Blake3Leaf, (), Blake3Hasher>::for_leaves_subset(
                 all_values,
                 remaining_as_leaves,
                 &mut ()
@@ -779,7 +796,7 @@ mod tests {
     #[test]
     fn error_gen_4() {
         assert_eq!(
-            MerkleProof::<Blake3Leaf, ()>::new(vec![], vec![], &mut ()).unwrap_err(),
+            MerkleProof::<LEN, Blake3Leaf, (), Blake3Hasher>::new(vec![], vec![]).unwrap_err(),
             ErrorMT::NoLeavesInput
         );
     }
@@ -787,7 +804,12 @@ mod tests {
     #[test]
     fn error_gen_5() {
         assert_eq!(
-            MerkleProof::<Blake3Leaf, ()>::for_leaves_subset(vec![], &[], &mut ()).unwrap_err(),
+            MerkleProof::<LEN, Blake3Leaf, (), Blake3Hasher>::for_leaves_subset(
+                vec![],
+                &[],
+                &mut ()
+            )
+            .unwrap_err(),
             ErrorMT::NoValuesInput
         );
     }

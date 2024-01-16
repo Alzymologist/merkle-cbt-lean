@@ -4,13 +4,15 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-blake3 = {version = "1.5.0", default-features = false}
+external-memory-tools = {git = "https://github.com/Alzymologist/external-memory-tools", default-features = false}
 
 [dev-dependencies]
+blake3 = {version = "1.5.0", default-features = false}
 merkle-cbt = {version = "0.3.2", default-features = false}
 
 [features]
-default = ["std"]
+default = ["blake3/std", "external-memory-tools/std", "proof-gen", "std"]
+proof-gen = []
 std = []
 
 [lib]
