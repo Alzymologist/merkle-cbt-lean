@@ -1,3 +1,105 @@
+//! This crate is a `no_std` compatible tool to generate Merkle trees and
+//! and calculate root values in constrained RAM environments.
+//! Merkle tree elements are addressable from external memory.
+//!
+//! The crate is based on CBMT implementation of the crate
+//! [`merkle-cbt`](https://docs.rs/merkle-cbt/latest/merkle_cbt/index.html).
+//! The root calculation outcomes are matching those of the `merkle-cbt` crate.
+//!
+//! Calculation itself differs, and lemmas have different sorting. `MerkleProof`
+//! constructions of the two crates **are not** interchangeable.
+//!
+//! In this crate, the root calculation is done with depth graph traverse, as
+//! opposed to width graph traverse in `merkle-cbt`. This approach substantially
+//! decreases memory requirements, at the cost of more time needed for the
+//! calculation.
+//!
+//! # Key traits and Merkle proof generation
+//!
+//! [`Leaf`] is generalized Merkle tree node, it has a corresponding value, an
+//! array of pre-known length N. Trait `Leaf` describes how such arrays could be
+//! read and (for `proof-gen` feature) written in memory.
+//!
+//! [`Hasher`] describes how the values of Merkle tree nodes are calculated and
+//! merged.
+//!
+//! [`MerkleProof`] contains leaves and lemmas, and root value could be
+//! calculated for it.
+//!
+//! # Example
+//! ```
+//! use external_memory_tools::ExternalMemory;
+//! use merkle_cbt_lean::{Hasher, Leaf, MerkleProof};
+//!
+//! const LEN: usize = 32;
+//!
+//! #[derive(Debug)]
+//! struct Blake3Hasher;
+//!
+//! impl Hasher<LEN> for Blake3Hasher {
+//!     fn make(bytes: &[u8]) -> [u8; LEN] {
+//!         blake3::hash(bytes).into()
+//!     }
+//!     fn merge(left: &[u8; LEN], right: &[u8; LEN]) -> [u8; LEN] {
+//!         blake3::hash(&[left.as_slice(), right.as_slice()].concat()).into()
+//!     }
+//! }
+//!
+//! #[derive(Copy, Clone, Debug)]
+//! struct Blake3Leaf([u8; LEN]);
+//!
+//! impl<E: ExternalMemory> Leaf<LEN, E> for Blake3Leaf {
+//!     fn read(&self, _ext_memory: &mut E) -> Result<[u8; LEN], E::ExternalMemoryError> {
+//!         Ok(self.0)
+//!     }
+//!     fn write(value: [u8; LEN], _ext_memory: &mut E) -> Result<Self, E::ExternalMemoryError> {
+//!         Ok(Self(value))
+//!     }
+//! }
+//!
+//! // All leaf values, deterministically sorted.
+//! let all_values = vec![[0; LEN], [1; LEN], [2; LEN], [3; LEN], [4; LEN], [5; LEN]];
+//!
+//! // Values that remain as leaves in the proof structure, other leaves will be
+//! // reduced to lemmas.
+//! // Remaining leaves will be available during the proof de-serialization.
+//! // It is assumed that the remaining leaf values are deterministically sorted
+//! // during serialization and de-serialization.
+//! let remaining_as_leaves = &[[0; LEN], [3; LEN], [1; LEN]];
+//!
+//! // Calculate `MerkleProof` for known complete set of values and known subset
+//! // of remaining values:
+//! let merkle_proof: MerkleProof<LEN, Blake3Leaf, (), Blake3Hasher> =
+//!     MerkleProof::for_leaves_subset(all_values, remaining_as_leaves, &mut ()).unwrap();
+//!
+//! // Serialize `MerkleProof` for data transferring:
+//!
+//! // Indices for remaining leaves:
+//! let indices = merkle_proof.indices();
+//!
+//! // Lemmas:
+//! let lemmas = merkle_proof.lemmas;
+//!
+//! // De-serialize `MerkleProof`:
+//! let mut merkle_proof_restored: MerkleProof<LEN, Blake3Leaf, (), Blake3Hasher> =
+//!     MerkleProof::new_with_external_indices(
+//!         remaining_as_leaves.to_vec(),
+//!         indices,
+//!         lemmas,
+//!     ).unwrap();
+//!
+//! // Calculate root:
+//! let root_restored = merkle_proof_restored.calculate_root(&mut ()).unwrap();
+//! ```
+//!
+//! # Features
+//!
+//! Crate supports `no_std` in `default-features = false` mode.
+//!
+//! With feature `proof-gen` (`no-std` compatible) [`MerkleProof`] could be
+//! generated for a subset of leaves. `proof-gen` is not needed to reconstruct
+//! `MerkleProof` from serialization, nor to calculate root for existing
+//! `MerkleProof`.
 #![no_std]
 #![deny(unused_crate_dependencies)]
 
@@ -32,7 +134,7 @@ use core::{
 
 use external_memory_tools::ExternalMemory;
 
-/// Trait describing how Merkle tree leaves are generated and merged.
+/// Describes how Merkle tree leaves are generated and merged.
 ///
 /// Leaves are always sized, generic parameter N is leaf size.
 pub trait Hasher<const N: usize> {
@@ -40,7 +142,7 @@ pub trait Hasher<const N: usize> {
     fn merge(left: &[u8; N], right: &[u8; N]) -> [u8; N];
 }
 
-/// Trait describing how Merkle tree leaves are accessed from memory.
+/// Describes how Merkle tree leaves are accessed from memory.
 ///
 /// Need to write the leaf into memory exists only when generating proof, is
 /// unlocked with feature `proof-gen`.
@@ -51,19 +153,17 @@ pub trait Leaf<const N: usize, E: ExternalMemory>: Clone + Copy + Debug + Sized 
     fn write(data: [u8; N], ext_memory: &mut E) -> Result<Self, E::ExternalMemoryError>;
 }
 
-pub fn first_leaf_index(total_leaves: usize) -> usize {
+/// Index of the first leaf.
+fn first_leaf_index(total_leaves: usize) -> usize {
     total_leaves - 1
 }
 
-pub fn number_of_layers<const N: usize, E: ExternalMemory>(
-    leaves: &[Node<N>],
-) -> Result<usize, ErrorMT<E>> {
-    match leaves.last() {
-        Some(a) => Ok(a.index.layer() as usize + 1usize),
-        None => Err(ErrorMT::NoLeavesInput),
-    }
+/// Number of layers for a given nodes set.
+fn number_of_layers<const N: usize>(nodes: &[Node<N>]) -> Option<usize> {
+    nodes.last().map(|a| a.index.layer() as usize + 1usize)
 }
 
+/// Check set of hashes for duplicates.
 #[cfg(any(feature = "proof-gen", test))]
 fn has_duplicates<const N: usize, E: ExternalMemory>(
     values: &[[u8; N]],
@@ -75,6 +175,7 @@ fn has_duplicates<const N: usize, E: ExternalMemory>(
     }
 }
 
+/// Combination of lemmas and leaves, sufficient to calculate Merkle tree root.
 #[derive(Debug)]
 pub struct MerkleProof<const N: usize, L, E, H>
 where
@@ -82,10 +183,20 @@ where
     E: ExternalMemory,
     H: Hasher<N>,
 {
+    /// Nodes existing as leaves
     pub leaves: Vec<Node<N>>,
+
+    /// Nodes existing as lemmas
     pub lemmas: Vec<L>,
+
+    /// Buffer, number of elements equals to the number of layers in
+    /// `MerkleProof`
     buffer: Vec<Option<[u8; N]>>,
+
+    /// Path to previously processed element
     previous_path: Option<Vec<Index>>,
+
+    /// Position of the leftmost leaf in the leaves iterator
     leftmost_leaf_position: usize,
     ext_memory: PhantomData<E>,
     hasher_type: PhantomData<H>,
@@ -97,8 +208,9 @@ where
     E: ExternalMemory,
     H: Hasher<N>,
 {
+    /// Make new `MerkleProof` from existing set of leaves and lemmas.
     pub fn new(leaves: Vec<Node<N>>, lemmas: Vec<L>) -> Result<Self, ErrorMT<E>> {
-        let number_of_layers = number_of_layers(&leaves)?;
+        let number_of_layers = number_of_layers::<N>(&leaves).ok_or(ErrorMT::NoLeavesInput)?;
 
         for i in 0..leaves.len() - 1 {
             for j in i + 1..leaves.len() {
@@ -131,6 +243,11 @@ where
         })
     }
 
+    /// Make new `MerkleProof` from leaves values, corresponding leaves `u32`
+    /// indices, and lemmas.
+    ///
+    /// Method is suitable for de-serialization in cases when values used to
+    /// generate leaves inside the proof are calculated from scratch.
     pub fn new_with_external_indices(
         leaves_values: Vec<[u8; N]>,
         indices: Vec<u32>,
@@ -147,6 +264,12 @@ where
         Self::new(leaves, lemmas)
     }
 
+    /// Calculate `MerkleProof` for a set of all existing leaves and a subset of
+    /// leaves that would not be reduced into lemmas.
+    ///
+    /// It is assumed here that the leaves in `all_values` input are already
+    /// sorted by some standard method.
+    /// No additional sorting is done here.
     #[cfg(any(feature = "proof-gen", test))]
     pub fn for_leaves_subset(
         all_values: Vec<[u8; N]>,
@@ -186,52 +309,61 @@ where
             }
         }
 
-        let number_of_layers = number_of_layers::<N, E>(&lemma_collector)?;
-
-        for layer in (0..number_of_layers).rev() {
-            let mut lemmas_modified = false;
-            let mut removal_set: Vec<Index> = Vec::new();
-            let mut added_lemmas: Vec<Node<N>> = Vec::new();
-            for (n, node) in lemma_collector.iter().enumerate() {
-                if node.index.layer() == layer as u32 {
-                    if let Some(node_sibling_index) = node.index.sibling() {
-                        if let Some(i) = lemma_collector.iter().position(|node_in_collector| {
-                            node_in_collector.index == node_sibling_index
-                        }) {
-                            if node.index.is_left() {
-                                removal_set.push(node.index);
-                                removal_set.push(node_sibling_index);
-                                let left_node = &lemma_collector[n];
-                                let right_node = &lemma_collector[i];
-                                let parent_index = left_node
-                                    .index
-                                    .parent()
-                                    .expect("if there is a sibling, there must be a parent");
-                                let parent_value = H::merge(&left_node.value, &right_node.value);
-                                added_lemmas.push(Node::new(parent_index, parent_value));
-                                lemmas_modified = true;
+        let lemmas = match number_of_layers::<N>(&lemma_collector) {
+            Some(number_of_layers) => {
+                for layer in (0..number_of_layers).rev() {
+                    let mut lemmas_modified = false;
+                    let mut removal_set: Vec<Index> = Vec::new();
+                    let mut added_lemmas: Vec<Node<N>> = Vec::new();
+                    for (n, node) in lemma_collector.iter().enumerate() {
+                        if node.index.layer() == layer as u32 {
+                            if let Some(node_sibling_index) = node.index.sibling() {
+                                if let Some(i) =
+                                    lemma_collector.iter().position(|node_in_collector| {
+                                        node_in_collector.index == node_sibling_index
+                                    })
+                                {
+                                    if node.index.is_left() {
+                                        removal_set.push(node.index);
+                                        removal_set.push(node_sibling_index);
+                                        let left_node = &lemma_collector[n];
+                                        let right_node = &lemma_collector[i];
+                                        let parent_index = left_node.index.parent().expect(
+                                            "if there is a sibling, there must be a parent",
+                                        );
+                                        let parent_value =
+                                            H::merge(&left_node.value, &right_node.value);
+                                        added_lemmas.push(Node::new(parent_index, parent_value));
+                                        lemmas_modified = true;
+                                    }
+                                }
                             }
                         }
                     }
+                    lemma_collector.retain(|x| !removal_set.contains(&x.index));
+                    lemma_collector.append(&mut added_lemmas);
+                    if !lemmas_modified {
+                        break;
+                    }
                 }
-            }
-            lemma_collector.retain(|x| !removal_set.contains(&x.index));
-            lemma_collector.append(&mut added_lemmas);
-            if !lemmas_modified {
-                break;
-            }
-        }
 
-        lemma_collector.sort_by(|a, b| a.index.path_top_down().cmp(&b.index.path_top_down()));
-        let mut lemmas: Vec<L> = Vec::new();
-        for node in lemma_collector.into_iter() {
-            let lemma_to_add = L::write(node.value, ext_memory).map_err(ErrorMT::ExternalMemory)?;
-            lemmas.push(lemma_to_add)
-        }
+                lemma_collector
+                    .sort_by(|a, b| a.index.path_top_down().cmp(&b.index.path_top_down()));
+                let mut lemmas: Vec<L> = Vec::new();
+                for node in lemma_collector.into_iter() {
+                    let lemma_to_add =
+                        L::write(node.value, ext_memory).map_err(ErrorMT::ExternalMemory)?;
+                    lemmas.push(lemma_to_add)
+                }
+                lemmas
+            }
+            None => Vec::new(),
+        };
 
         Self::new(leaves, lemmas)
     }
 
+    /// Provide ordered set of `u32` indices for all leaves in `MerkleProof`.
     pub fn indices(&self) -> Vec<u32> {
         let mut out: Vec<u32> = Vec::new();
         for leaf in self.leaves.iter() {
@@ -240,7 +372,8 @@ where
         out
     }
 
-    pub fn lemmas(&self, ext_memory: &mut E) -> Result<Vec<[u8; N]>, ErrorMT<E>> {
+    /// Provide ordered set of lemma values from `MerkleProof`.
+    pub fn lemma_values(&self, ext_memory: &mut E) -> Result<Vec<[u8; N]>, ErrorMT<E>> {
         let mut out: Vec<[u8; N]> = Vec::new();
         for lemma in self.lemmas.iter() {
             out.push(lemma.read(ext_memory).map_err(ErrorMT::ExternalMemory)?);
@@ -248,6 +381,8 @@ where
         Ok(out)
     }
 
+    /// Merge next sibling nodes, one of the iterative steps in calculating the
+    /// root.
     pub fn update(&mut self, ext_memory: &mut E) -> Result<(), ErrorMT<E>> {
         let leftmost_leaf = self.leftmost_leaf();
         let leftmost_leaf_index = leftmost_leaf.index;
@@ -322,6 +457,8 @@ where
         Ok(())
     }
 
+    /// Take the leftmost leaf for processing and accordingly shift the leftmost
+    /// leaf position.
     pub fn leftmost_leaf(&mut self) -> &Node<N> {
         let leftmost_leaf = &self.leaves[self.leftmost_leaf_position];
         self.leftmost_leaf_position += 1;
@@ -331,6 +468,8 @@ where
         leftmost_leaf
     }
 
+    /// Index of the first layer under the node at which the previous known path
+    /// of `MerkleProof` deviates from the provided path.
     pub fn first_layer_below_bifurcation(&self, path: &[Index]) -> Result<usize, ErrorMT<E>> {
         match &self.previous_path {
             Some(known_previous_path) => {
@@ -350,6 +489,7 @@ where
         }
     }
 
+    /// Calculate root for `MerkleProof` through iterative updates.
     pub fn calculate_root(&mut self, ext_memory: &mut E) -> Result<[u8; N], ErrorMT<E>> {
         let mut found_root: Option<[u8; N]> = None;
 
@@ -407,6 +547,7 @@ where
     }
 }
 
+/// Errors in Merkle tree construction and processing.
 #[derive(Debug, Eq, PartialEq)]
 pub enum ErrorMT<E: ExternalMemory> {
     DuplicateLeafValues,
@@ -425,17 +566,17 @@ pub enum ErrorMT<E: ExternalMemory> {
 impl<E: ExternalMemory> ErrorMT<E> {
     fn error_text(&self) -> String {
         match &self {
-            ErrorMT::DuplicateLeafValues => String::from(""),
-            ErrorMT::DuplicateRemainingValues => String::from(""),
-            ErrorMT::ExternalMemory(external_memory_error) => format!(" {external_memory_error}"),
-            ErrorMT::IndicesValuesLengthMismatch => String::from(""),
-            ErrorMT::LemmasNotEmpty => String::from(""),
-            ErrorMT::NoLeavesInput => String::from(""),
-            ErrorMT::NoValuesInput => String::from(""),
-            ErrorMT::PrevPathShorter => String::from(""),
-            ErrorMT::PrevPathIdentical => String::from(""),
-            ErrorMT::RootUnavailable => String::from(""),
-            ErrorMT::UnknownRemainingLeaf => String::from(""),
+            ErrorMT::DuplicateLeafValues => String::from("Error constructing Merkle proof. There are duplicates in complete set of leaf values."),
+            ErrorMT::DuplicateRemainingValues => String::from("Error constructing Merkle proof. There are duplicates in provided set of remaining leaf values."),
+            ErrorMT::ExternalMemory(external_memory_error) => format!("External memory error. {external_memory_error}"),
+            ErrorMT::IndicesValuesLengthMismatch => String::from("Error de-serializing the Merkle proof. Number of indices for leaves does not match the number of leaves."),
+            ErrorMT::LemmasNotEmpty => String::from("Error calculating Merkle root. Some lemmas from the proof remained unused."),
+            ErrorMT::NoLeavesInput => String::from("Error constructing Merkle proof. No leaves provided."),
+            ErrorMT::NoValuesInput => String::from("Error constructing Merkle proof. Provided set of leaf values is empty."),
+            ErrorMT::PrevPathShorter => String::from("Unable to find bifurcation point. Path to previously processed node is shorter. This is a bug, please report it."),
+            ErrorMT::PrevPathIdentical => String::from("Unable to find bifurcation point. Path to previously processed node is exactly same. This is a bug, please report it."),
+            ErrorMT::RootUnavailable => String::from("Provided data is insufficient to calculate Merkle root."),
+            ErrorMT::UnknownRemainingLeaf => String::from("Error constructing Merkle proof. Provided set of remaining leaf values contains a value that is not found in the complete set."),
         }
     }
 }
@@ -453,6 +594,7 @@ impl<E: ExternalMemory> Error for ErrorMT<E> {
     }
 }
 
+/// Node, a combination of index and hash value.
 #[derive(Clone, Copy, Debug)]
 pub struct Node<const N: usize> {
     pub index: Index,
@@ -465,14 +607,43 @@ impl<const N: usize> Node<N> {
     }
 }
 
+/// Node index.
+///
+/// All nodes in the Merkle tree structure are indexed as schematically shown
+/// below:
+/// ```text
+///             (0, or root)            layer 0
+///          /               \
+///        (1)               (2)        layer 1
+///      /     \           /     \
+///    (3)     (4)       (5)     (6)    layer 2
+///   /  \     /  \     /  \
+/// (7)  (8) (9) (10) (11) (12)         layer 3
+/// ```
+///
+/// Indexation persists even though in Merkle proof structure some leaves may
+/// already be reduced to the lemmas. In the scheme below, square brackets
+/// denote data available through lemmas, angle brackets denote data available
+/// as actual leaves:
+/// ```text
+///             (0, or root)
+///          /               \
+///        (1)               [2]
+///      /     \           /     \
+///    (3)     [4]       (5)     <6>
+///   /  \              /  \
+/// <7>  [8]          <11> <12>
+/// ```
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct Index(pub u32);
 
 impl Index {
+    /// Layer corresponding to the index.
     pub fn layer(&self) -> u32 {
         (self.0 + 1).ilog2()
     }
 
+    /// Set of indices leading from the root to the node with a given index.
     pub fn path_top_down(&self) -> Vec<Index> {
         let mut out: Vec<Index> = Vec::with_capacity(self.layer() as usize);
         let mut current_index = *self;
@@ -484,6 +655,8 @@ impl Index {
         out
     }
 
+    /// Index of the node with which the given node would be merged to calculate
+    /// their parent node.
     pub fn sibling(&self) -> Option<Self> {
         if self.0 == 0 {
             None
@@ -492,6 +665,7 @@ impl Index {
         }
     }
 
+    /// Index of the parent node for the given node.
     pub fn parent(&self) -> Option<Self> {
         if self.0 == 0 {
             None
@@ -500,6 +674,7 @@ impl Index {
         }
     }
 
+    /// Is the node left? (This affects how it is merged.)
     pub fn is_left(&self) -> bool {
         self.0 % 2 == 1
     }
@@ -693,12 +868,10 @@ mod tests {
     fn proof_test_1() {
         let all_values = vec![[0; 32], [1; 32]];
         let remaining_as_leaves = &[[0; 32]];
+        let root_merkle_cbt = CBMT::<[u8; 32], MergeHashes>::build_merkle_root(&all_values);
         let mut merkle_proof: MerkleProof<LEN, Blake3Leaf, (), Blake3Hasher> =
             MerkleProof::for_leaves_subset(all_values, remaining_as_leaves, &mut ()).unwrap();
         let root: [u8; 32] = merkle_proof.calculate_root(&mut ()).unwrap();
-
-        let leaves = &[[0; 32], [1; 32]];
-        let root_merkle_cbt = CBMT::<[u8; 32], MergeHashes>::build_merkle_root(leaves);
         assert_eq!(root, root_merkle_cbt);
     }
 
@@ -706,12 +879,10 @@ mod tests {
     fn proof_test_2() {
         let all_values = vec![[0; 32], [1; 32], [2; 32], [3; 32], [4; 32]];
         let remaining_as_leaves = &[[0; 32], [2; 32]];
+        let root_merkle_cbt = CBMT::<[u8; 32], MergeHashes>::build_merkle_root(&all_values);
         let mut merkle_proof: MerkleProof<LEN, Blake3Leaf, (), Blake3Hasher> =
             MerkleProof::for_leaves_subset(all_values, remaining_as_leaves, &mut ()).unwrap();
         let root: [u8; 32] = merkle_proof.calculate_root(&mut ()).unwrap();
-
-        let leaves = &[[0; 32], [1; 32], [2; 32], [3; 32], [4; 32]];
-        let root_merkle_cbt = CBMT::<[u8; 32], MergeHashes>::build_merkle_root(leaves);
         assert_eq!(root, root_merkle_cbt);
     }
 
@@ -721,14 +892,10 @@ mod tests {
             [0; 32], [1; 32], [2; 32], [3; 32], [4; 32], [5; 32], [6; 32],
         ];
         let remaining_as_leaves = &[[0; 32], [6; 32]];
+        let root_merkle_cbt = CBMT::<[u8; 32], MergeHashes>::build_merkle_root(&all_values);
         let mut merkle_proof: MerkleProof<LEN, Blake3Leaf, (), Blake3Hasher> =
             MerkleProof::for_leaves_subset(all_values, remaining_as_leaves, &mut ()).unwrap();
         let root: [u8; 32] = merkle_proof.calculate_root(&mut ()).unwrap();
-
-        let leaves = &[
-            [0; 32], [1; 32], [2; 32], [3; 32], [4; 32], [5; 32], [6; 32],
-        ];
-        let root_merkle_cbt = CBMT::<[u8; 32], MergeHashes>::build_merkle_root(leaves);
         assert_eq!(root, root_merkle_cbt);
     }
 
@@ -743,6 +910,17 @@ mod tests {
             MerkleProof::for_leaves_subset(test_set, test_subset.as_slice(), &mut ()).unwrap();
         let root: [u8; 32] = merkle_proof.calculate_root(&mut ()).unwrap();
 
+        assert_eq!(root, root_merkle_cbt);
+    }
+
+    #[test]
+    fn proof_test_5() {
+        let all_values = vec![[0; 32], [1; 32], [2; 32], [3; 32], [4; 32], [5; 32]];
+        let remaining_as_leaves = &[[0; 32], [1; 32], [2; 32], [3; 32], [4; 32], [5; 32]];
+        let root_merkle_cbt = CBMT::<[u8; 32], MergeHashes>::build_merkle_root(&all_values);
+        let mut merkle_proof: MerkleProof<LEN, Blake3Leaf, (), Blake3Hasher> =
+            MerkleProof::for_leaves_subset(all_values, remaining_as_leaves, &mut ()).unwrap();
+        let root: [u8; 32] = merkle_proof.calculate_root(&mut ()).unwrap();
         assert_eq!(root, root_merkle_cbt);
     }
 
