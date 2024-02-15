@@ -1,20 +1,30 @@
 //! This crate is a `no_std` compatible tool to generate Merkle trees and
 //! and calculate root values in constrained RAM environments.
-//! Merkle tree elements are addressable from external memory.
+//! Merkle tree elements are addressable from generalized "external" memory
+//! which could be anything from regular address space to address space 
+//! on remote storage with arbitrary access rules, or even serial input pipes.
 //!
 //! The crate is based on CBMT implementation of the crate
 //! [`merkle-cbt`](https://docs.rs/merkle-cbt/latest/merkle_cbt/index.html).
 //! The root calculation outcomes are matching those of the `merkle-cbt` crate.
 //!
-//! Calculation itself differs, and lemmas have different sorting. `MerkleProof`
-//! constructions of the two crates **are not** interchangeable.
+//! Calculation sequence differs, and lemmas have different sorting. 
+//! `MerkleProof` constructions of the two crates **are not** interchangeable.
+//!
+//! In this crate, all lemmas of the proof are sorted strictly left-to-right.
+//! It is also assumed that the proof was generated strictly by this algorithm:
+//! if the proof is not optimized, i.e., there are lemmas that could be merged 
+//! without supplying valuer of leaves to be checked, this process will fail.
 //!
 //! In this crate, the root calculation is done with depth graph traverse, as
 //! opposed to width graph traverse in `merkle-cbt`. This approach substantially
-//! decreases memory requirements, at the cost of more time needed for the
-//! calculation.
+//! decreases memory requirements (other than lemmas and leaves storage space,
+//! it stores only one hash per tree layer to total ~log(n),
+//! opposed to storing whole layer in width traverse algorithms, ~n),
+//! at the cost of more time needed for the calculation
+//! (roughly O(n^2) versus O(n)).
 //!
-//! # Key traits and Merkle proof generation
+//! # Key definitions
 //!
 //! [`Leaf`] is generalized Merkle tree node, it has a corresponding value, an
 //! array of pre-known length N. Trait `Leaf` describes how such arrays could be
@@ -212,6 +222,7 @@ where
     pub fn new(leaves: Vec<Node<N>>, lemmas: Vec<L>) -> Result<Self, ErrorMT<E>> {
         let number_of_layers = number_of_layers::<N>(&leaves).ok_or(ErrorMT::NoLeavesInput)?;
 
+        // Input should be deduplicated
         for i in 0..leaves.len() - 1 {
             for j in i + 1..leaves.len() {
                 if leaves[j].value == leaves[i].value {
@@ -264,11 +275,10 @@ where
         Self::new(leaves, lemmas)
     }
 
-    /// Calculate `MerkleProof` for a set of all existing leaves and a subset of
-    /// leaves that would not be reduced into lemmas.
+    /// Calculate `MerkleProof` for a complete set of leaf values 
+    /// and a subset of leaf values that would not be reduced into lemmas.
     ///
-    /// It is assumed here that the leaves in `all_values` input are already
-    /// sorted by some standard method.
+    /// It is assumed here that the leaf values are deterministically sorted.
     /// No additional sorting is done here.
     #[cfg(any(feature = "proof-gen", test))]
     pub fn for_leaves_subset(
@@ -287,6 +297,7 @@ where
 
         let mut remaining_indices_in_whole_set: Vec<usize> = Vec::new();
 
+        // find indices corresponding to remaining leaf values in complete set
         for remaining_value in remaining_as_leaves.iter() {
             let index_in_whole_set = all_values
                 .iter()
@@ -298,6 +309,7 @@ where
         let mut leaves: Vec<Node<N>> = Vec::new();
         let mut lemma_collector: Vec<Node<N>> = Vec::new();
 
+        // Spli nodes into remaining set and lemma collector
         for (index_in_whole_set, value) in all_values.into_iter().enumerate() {
             let index = Index((index_in_whole_set + first_leaf_index) as u32);
             let node = Node::new(index, value);
@@ -311,6 +323,8 @@ where
 
         let lemmas = match number_of_layers::<N>(&lemma_collector) {
             Some(number_of_layers) => {
+                
+                // Merge all nodes that could be merged in lemma collector
                 for layer in (0..number_of_layers).rev() {
                     let mut lemmas_modified = false;
                     let mut removal_set: Vec<Index> = Vec::new();
@@ -347,6 +361,7 @@ where
                     }
                 }
 
+                // Sort lemmas left-to-right
                 lemma_collector
                     .sort_by(|a, b| a.index.path_top_down().cmp(&b.index.path_top_down()));
                 let mut lemmas: Vec<L> = Vec::new();
@@ -392,6 +407,9 @@ where
         let first_layer_below_bifurcation = self.first_layer_below_bifurcation(&path_top_down)?;
 
         let mut new_buffer_calc: Option<[u8; N]> = None;
+
+        // First traverse path up until layer below bifurcation 
+        // and merge all leaves on the left
         for (i, buffer_element) in self.buffer.iter_mut().enumerate().rev() {
             if i == first_layer_below_bifurcation {
                 break;
@@ -423,10 +441,12 @@ where
                 ));
             }
         }
+
         if let Some(new_buffer_calc_content) = new_buffer_calc {
             self.buffer[first_layer_below_bifurcation] = Some(new_buffer_calc_content);
         }
 
+        // Second, traverse path down and fill buffer with lemmas on the right
         for (layer, index) in path_top_down.iter().enumerate() {
             if layer < first_layer_below_bifurcation {
                 continue;
@@ -441,6 +461,8 @@ where
             }
         }
 
+        // Finally, traverse buffer up merging all nodes that could be merged,
+        // starting from next leftmost leaf
         let mut new_buffer_calc = leftmost_leaf_value;
         for (i, buffer_element) in self.buffer.iter_mut().enumerate().rev() {
             if leftmost_leaf_index.layer() >= i as u32 {
@@ -497,6 +519,9 @@ where
         for _i in 0..self.leaves.len() {
             self.update(ext_memory)?;
         }
+
+        // Last vertical traverse after all leaves are consumed
+        // to process rightmost lemmas
         let mut new_buffer_calc: Option<[u8; N]> = None;
         for (i, buffer_element) in self.buffer.iter_mut().enumerate().rev() {
             if i == 0 {
@@ -628,7 +653,7 @@ impl<const N: usize> Node<N> {
 /// ```text
 ///             (0, or root)
 ///          /               \
-///        (1)               [2]
+///        (1)               (2)
 ///      /     \           /     \
 ///    (3)     [4]       (5)     <6>
 ///   /  \              /  \
