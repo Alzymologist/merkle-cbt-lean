@@ -2,7 +2,7 @@
 description = "Special implementation of Complete Merkle Binary Tree for minimal memory footprint."
 license = "GPL-3.0-or-later"
 name = "merkle-cbt-lean"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["Alexander Slesarev <slesarew@gmail.com>", "Vera Abramova <abramova.vera@gmail.com>"]
 edition = "2021"
 repository = "https://github.com/Alzymologist/merkle-cbt-lean"
