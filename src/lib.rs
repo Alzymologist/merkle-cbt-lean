@@ -1,19 +1,19 @@
 //! This crate is a `no_std` compatible tool to generate Merkle trees and
 //! and calculate root values in constrained RAM environments.
 //! Merkle tree elements are addressable from generalized "external" memory
-//! which could be anything from regular address space to address space 
+//! which could be anything from regular address space to address space
 //! on remote storage with arbitrary access rules, or even serial input pipes.
 //!
 //! The crate is based on CBMT implementation of the crate
 //! [`merkle-cbt`](https://docs.rs/merkle-cbt/latest/merkle_cbt/index.html).
 //! The root calculation outcomes are matching those of the `merkle-cbt` crate.
 //!
-//! Calculation sequence differs, and lemmas have different sorting. 
+//! Calculation sequence differs, and lemmas have different sorting.
 //! `MerkleProof` constructions of the two crates **are not** interchangeable.
 //!
 //! In this crate, all lemmas of the proof are sorted strictly left-to-right.
 //! It is also assumed that the proof was generated strictly by this algorithm:
-//! if the proof is not optimized, i.e., there are lemmas that could be merged 
+//! if the proof is not optimized, i.e., there are lemmas that could be merged
 //! without supplying valuer of leaves to be checked, this process will fail.
 //!
 //! In this crate, the root calculation is done with depth graph traverse, as
@@ -275,7 +275,7 @@ where
         Self::new(leaves, lemmas)
     }
 
-    /// Calculate `MerkleProof` for a complete set of leaf values 
+    /// Calculate `MerkleProof` for a complete set of leaf values
     /// and a subset of leaf values that would not be reduced into lemmas.
     ///
     /// It is assumed here that the leaf values are deterministically sorted.
@@ -323,7 +323,6 @@ where
 
         let lemmas = match number_of_layers::<N>(&lemma_collector) {
             Some(number_of_layers) => {
-                
                 // Merge all nodes that could be merged in lemma collector
                 for layer in (0..number_of_layers).rev() {
                     let mut lemmas_modified = false;
@@ -408,7 +407,7 @@ where
 
         let mut new_buffer_calc: Option<[u8; N]> = None;
 
-        // First traverse path up until layer below bifurcation 
+        // First traverse path up until layer below bifurcation
         // and merge all leaves on the left
         for (i, buffer_element) in self.buffer.iter_mut().enumerate().rev() {
             if i == first_layer_below_bifurcation {
