@@ -309,7 +309,7 @@ where
         let mut leaves: Vec<Node<N>> = Vec::new();
         let mut lemma_collector: Vec<Node<N>> = Vec::new();
 
-        // Spli nodes into remaining set and lemma collector
+        // Split nodes into remaining set and lemma collector
         for (index_in_whole_set, value) in all_values.into_iter().enumerate() {
             let index = Index((index_in_whole_set + first_leaf_index) as u32);
             let node = Node::new(index, value);
